@@ -1,0 +1,9 @@
+{
+  "destination": "/Users/YOUR_NAME/Pictures/WeChat Media",
+  "mode": "allRecentChats",
+  "chats": [],
+  "maxItemsPerChat": 500,
+  "maxScrollPages": 200,
+  "stopOnExisting": true,
+  "waitForDownloadsSeconds": 120
+}
