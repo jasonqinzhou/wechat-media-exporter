@@ -4,7 +4,7 @@ import CryptoKit
 import Foundation
 
 private let weChatBundleID = "com.tencent.xinWeChat"
-private let exporterVersion = "0.3.0"
+private let exporterVersion = "0.3.1"
 private let scheduleLabel = "com.local.wechat-media-exporter.daily"
 
 private let saveControlNames = [
@@ -223,6 +223,15 @@ final class WeChatAutomation {
         windows().first { string($0, kAXTitleAttribute as CFString).hasPrefix(titlePrefix) }
     }
 
+    private func isChatHistoryWindow(_ element: AXUIElement) -> Bool {
+        let title = string(element, kAXTitleAttribute as CFString)
+        return title.hasPrefix("Chat history of") || title.hasPrefix("Chat history with")
+    }
+
+    private func chatHistoryWindow() -> AXUIElement? {
+        windows().first(where: isChatHistoryWindow)
+    }
+
     private func wait<T>(seconds: TimeInterval, every: TimeInterval = 0.1, _ body: () -> T?) -> T? {
         let deadline = Date().addingTimeInterval(seconds)
         repeat {
@@ -352,7 +361,7 @@ final class WeChatAutomation {
                 _ = press(cancel)
                 pause(0.25)
             }
-            if title == "Photos and Videos" || title.hasPrefix("Chat history of") || title == "Save" {
+            if title == "Photos and Videos" || isChatHistoryWindow(target) || title == "Save" {
                 closeWindow(target)
             }
         }
@@ -361,8 +370,17 @@ final class WeChatAutomation {
     // MARK: - Chat discovery
 
     private func mainWindow() throws -> AXUIElement {
-        if let main = window(exactTitle: "Weixin") { return main }
-        if let main = window(exactTitle: "WeChat") { return main }
+        let candidates = windows().filter { candidate in
+            let title = string(candidate, kAXTitleAttribute as CFString)
+            return title == "Weixin" || title == "WeChat"
+        }
+        if let main = candidates.max(by: { lhs, rhs in
+            let left = frame(lhs).map { $0.width * $0.height } ?? 0
+            let right = frame(rhs).map { $0.width * $0.height } ?? 0
+            return left < right
+        }) {
+            return main
+        }
         throw ExporterError.message("The WeChat chats window is not visible. Open its main window and try again.")
     }
 
@@ -400,7 +418,8 @@ final class WeChatAutomation {
         for element in elements(in: list, role: kAXStaticTextRole as String) {
             let title = string(element, kAXTitleAttribute as CFString)
             guard !title.isEmpty, let bounds = frame(element), bounds.width > 0, bounds.height > 0,
-                  bounds.intersects(listFrame) else { continue }
+                  bounds.minY >= listFrame.minY,
+                  bounds.maxY <= listFrame.maxY else { continue }
             let name = title.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !name.isEmpty, seen.insert(name).inserted else { continue }
             rows.append(ChatRow(name: name, element: element, frame: bounds))
@@ -429,8 +448,10 @@ final class WeChatAutomation {
             bringForward(main)
             let freshRow = try visibleChatRows().first(where: { $0.name == row.name }) ?? row
             try mouseClick(freshRow.element)
-            if wait(seconds: 2.5, {
-                self.elements(in: main, role: kAXButtonRole as String, title: "Chat History").first
+            if wait(seconds: 2.5, { () -> Bool? in
+                guard self.elements(in: main, role: kAXButtonRole as String, title: "Chat History").first != nil,
+                      (try? self.currentChatName()) == row.name else { return nil }
+                return true
             }) != nil {
                 return
             }
@@ -540,22 +561,29 @@ final class WeChatAutomation {
     }
 
     private func commitDestination(_ dialog: SaveDialog) throws {
-        if let rawButton = attribute(dialog.root, kAXDefaultButtonAttribute as CFString) {
-            let button = rawButton as! AXUIElement
-            if bool(button, kAXEnabledAttribute as CFString), press(button) { return }
+        for container in [dialog.root, dialog.hostWindow] {
+            if let rawButton = attribute(container, kAXDefaultButtonAttribute as CFString) {
+                let button = rawButton as! AXUIElement
+                if bool(button, kAXEnabledAttribute as CFString), press(button) { return }
+            }
         }
-        guard let button = elements(in: dialog.root, role: kAXButtonRole as String).last(where: { candidate in
+        let buttons = elements(in: dialog.root, role: kAXButtonRole as String)
+            + elements(in: dialog.hostWindow, role: kAXButtonRole as String)
+        if let button = buttons.last(where: { candidate in
             bool(candidate, kAXEnabledAttribute as CFString)
                 && controlStrings(candidate).contains(where: isDestinationConfirmName)
-        }) else {
-            let visible = buttonDiagnostics(in: dialog.root)
-            throw ExporterError.message(
-                "The folder chooser's confirmation button was unavailable. Visible buttons: \(visible)"
-            )
+        }) {
+            guard press(button) else {
+                throw ExporterError.message("The folder chooser's confirmation button could not be pressed.")
+            }
+            return
         }
-        guard press(button) else {
-            throw ExporterError.message("The folder chooser's confirmation button could not be pressed.")
-        }
+
+        // Some macOS folder panels temporarily expose no button descendants
+        // after their Go to Folder sheet closes. Return still activates the
+        // panel's default Store/Choose action; the caller verifies closure.
+        bringForward(dialog.hostWindow)
+        sendKey(36) // Return
     }
 
     private func cleanFolderName(_ raw: String) -> String {
@@ -575,7 +603,7 @@ final class WeChatAutomation {
             throw ExporterError.message("No current chat is selected, or its Chat History button is unavailable.")
         }
         try mouseClick(historyButton)
-        guard let history = wait(seconds: 8, { self.window(titlePrefix: "Chat history of") }) else {
+        guard let history = wait(seconds: 8, { self.chatHistoryWindow() }) else {
             throw ExporterError.message("WeChat did not open Chat History.")
         }
         bringForward(history)
@@ -798,20 +826,8 @@ final class WeChatAutomation {
         )
     }
 
-    private func galleryScrollValue(_ history: AXUIElement) -> Double? {
-        let scrollBars = elements(in: history, role: kAXScrollBarRole as String).filter { scrollBar in
-            guard let bounds = frame(scrollBar) else { return false }
-            return bounds.height > bounds.width
-        }
-        return scrollBars.compactMap { scrollBar in
-            (attribute(scrollBar, kAXValueAttribute as CFString) as? NSNumber)?.doubleValue
-        }.max()
-    }
-
-    @discardableResult
-    private func scrollGalleryDown(_ history: AXUIElement) -> Bool {
-        guard let bounds = frame(history) else { return false }
-        let before = galleryScrollValue(history)
+    private func scrollGalleryDown(_ history: AXUIElement) {
+        guard let bounds = frame(history) else { return }
         bringForward(history)
         let point = CGPoint(x: bounds.midX, y: bounds.maxY - 100)
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
@@ -820,13 +836,12 @@ final class WeChatAutomation {
             usleep(80_000)
         }
         pause(0.7)
-        guard let before, let after = galleryScrollValue(history) else { return true }
-        return abs(after - before) > 0.000_001
     }
 
     private func exportGallery(destination: URL) throws -> ExportStats {
         var stats = ExportStats()
         var selectedTotal = 0
+        var emptyBatchStreak = 0
         let history = try openHistoryMedia()
         let staging = destination.appendingPathComponent(
             ".wechat-media-exporter-staging-\(UUID().uuidString)",
@@ -838,7 +853,7 @@ final class WeChatAutomation {
             clearBatchSelection(in: history)
             sendKey(53)
             pause(0.2)
-            if window(titlePrefix: "Chat history of") != nil { closeWindow(history) }
+            if chatHistoryWindow() != nil { closeWindow(history) }
 
             if directoryIsEmpty(staging) {
                 try? fileManager.removeItem(at: staging)
@@ -863,7 +878,6 @@ final class WeChatAutomation {
                     tiles: tiles,
                     maximumCount: remaining
                 )
-                selectedTotal += selection.selectedCount
                 let result = try saveSelectedBatch(
                     in: history,
                     saveButton: selection.button,
@@ -871,15 +885,36 @@ final class WeChatAutomation {
                     staging: staging,
                     destination: destination
                 )
-                stats.saved += result.saved
-                stats.existing += result.existing
-                stats.skipped += result.skipped
-                print(
-                    "  Batch: \(result.selected) selected, \(result.saved) saved, "
-                    + "\(result.existing) already present, \(result.skipped) unavailable skipped."
-                )
+                let produced = result.saved + result.existing
+                if produced == 0 {
+                    emptyBatchStreak += 1
+                    if emptyBatchStreak == 1 {
+                        selectedTotal += result.selected
+                        stats.skipped += result.selected
+                        print(
+                            "  Batch: \(result.selected) selected, 0 files produced; "
+                            + "\(result.selected) unavailable skipped."
+                        )
+                    } else {
+                        print(
+                            "  Batch: no files produced again; stopping to avoid "
+                            + "repeating the gallery endpoint."
+                        )
+                    }
+                } else {
+                    emptyBatchStreak = 0
+                    selectedTotal += result.selected
+                    stats.saved += result.saved
+                    stats.existing += result.existing
+                    stats.skipped += result.skipped
+                    print(
+                        "  Batch: \(result.selected) selected, \(result.saved) saved, "
+                        + "\(result.existing) already present, \(result.skipped) unavailable skipped."
+                    )
+                }
 
                 if config.stopOnExisting, result.saved == 0, result.existing > 0 { break }
+                if emptyBatchStreak >= 2 { break }
             } catch {
                 stats.failed += 1
                 print("  Batch warning: \(error.localizedDescription)")
@@ -889,7 +924,7 @@ final class WeChatAutomation {
             }
 
             if selectedTotal >= max(1, config.maxItemsPerChat) { break }
-            if !scrollGalleryDown(history) { break }
+            scrollGalleryDown(history)
         }
         return stats
     }
