@@ -5,5 +5,5 @@
   "maxItemsPerChat": 500,
   "maxScrollPages": 200,
   "stopOnExisting": true,
-  "waitForDownloadsSeconds": 120
+  "waitForDownloadsSeconds": 600
 }

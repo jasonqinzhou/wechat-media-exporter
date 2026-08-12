@@ -4,26 +4,8 @@ import CryptoKit
 import Foundation
 
 private let weChatBundleID = "com.tencent.xinWeChat"
-private let exporterVersion = "0.2.0"
+private let exporterVersion = "0.3.0"
 private let scheduleLabel = "com.local.wechat-media-exporter.daily"
-
-private let unavailableMediaMarkers = [
-    "expired or deleted",
-    "expired or has been deleted",
-    "has expired or been deleted",
-    "has expired or has been deleted",
-    "expired or been cleaned",
-    "expired or cleaned",
-    "no longer available",
-    "已过期或已被清理",
-    "已過期或已被清理",
-    "图片已过期",
-    "圖片已過期",
-    "视频已过期",
-    "影片已過期",
-    "檔案已過期",
-    "文件已过期"
-]
 
 private let saveControlNames = [
     "save", "save as", "保存", "另存为", "另存為", "儲存", "存储", "下载", "下載"
@@ -31,16 +13,10 @@ private let saveControlNames = [
 
 private let cancelControlNames = ["cancel", "取消"]
 
-private func unavailableMediaMessage(in strings: [String]) -> String? {
-    for original in strings {
-        let normalized = original.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else { continue }
-        if unavailableMediaMarkers.contains(where: { normalized.contains($0) }) {
-            return String(original.prefix(160))
-        }
-    }
-    return nil
-}
+private let destinationConfirmNames = [
+    "choose", "choose folder", "select", "select folder", "open", "store", "storage",
+    "选取", "選取", "选择", "選擇", "打开", "打開"
+]
 
 private func isSaveControlName(_ value: String) -> Bool {
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -50,6 +26,58 @@ private func isSaveControlName(_ value: String) -> Bool {
 private func isCancelControlName(_ value: String) -> Bool {
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return cancelControlNames.contains(normalized)
+}
+
+private func isDestinationConfirmName(_ value: String) -> Bool {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return isSaveControlName(normalized) || destinationConfirmNames.contains(normalized)
+}
+
+private func selectionDragPoints(for frames: [CGRect], within container: CGRect) -> (start: CGPoint, end: CGPoint)? {
+    guard var selection = frames.first else { return nil }
+    for item in frames.dropFirst() { selection = selection.union(item) }
+
+    let inset: CGFloat = 5
+    let margin: CGFloat = 9
+    let usable = container.insetBy(dx: inset, dy: inset)
+    let start = CGPoint(
+        x: max(usable.minX, selection.minX - margin),
+        y: max(usable.minY, selection.minY - margin)
+    )
+    let end = CGPoint(
+        x: min(usable.maxX, selection.maxX + margin),
+        y: min(usable.maxY, selection.maxY + margin)
+    )
+    guard start.x < selection.minX, start.y < selection.minY,
+          end.x > selection.maxX, end.y > selection.maxY else { return nil }
+    return (start, end)
+}
+
+private func mergeStagedFiles(
+    fileManager: FileManager,
+    from staging: URL,
+    into destination: URL
+) throws -> (saved: Int, existing: Int) {
+    let files = try fileManager.contentsOfDirectory(
+        at: staging,
+        includingPropertiesForKeys: [.isRegularFileKey],
+        options: [.skipsHiddenFiles]
+    )
+    var saved = 0
+    var existing = 0
+    for source in files {
+        let values = try source.resourceValues(forKeys: [.isRegularFileKey])
+        guard values.isRegularFile == true else { continue }
+        let target = destination.appendingPathComponent(source.lastPathComponent)
+        if fileManager.fileExists(atPath: target.path) {
+            try fileManager.removeItem(at: source)
+            existing += 1
+        } else {
+            try fileManager.moveItem(at: source, to: target)
+            saved += 1
+        }
+    }
+    return (saved, existing)
 }
 
 enum ExporterError: LocalizedError {
@@ -62,16 +90,6 @@ enum ExporterError: LocalizedError {
     }
 }
 
-enum MediaItemError: LocalizedError {
-    case unavailable(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .unavailable(let message): return message
-        }
-    }
-}
-
 struct Config: Codable {
     var destination: String
     var mode: String = "allRecentChats"
@@ -79,7 +97,7 @@ struct Config: Codable {
     var maxItemsPerChat: Int = 500
     var maxScrollPages: Int = 200
     var stopOnExisting: Bool = true
-    var waitForDownloadsSeconds: Int = 120
+    var waitForDownloadsSeconds: Int = 600
 }
 
 struct ExportStats {
@@ -87,6 +105,13 @@ struct ExportStats {
     var existing = 0
     var skipped = 0
     var failed = 0
+}
+
+struct BatchExportResult {
+    var selected = 0
+    var saved = 0
+    var existing = 0
+    var skipped = 0
 }
 
 struct ChatRow {
@@ -111,7 +136,6 @@ final class WeChatAutomation {
     private(set) var application: NSRunningApplication
     private(set) var root: AXUIElement
     private let config: Config
-    private var lastConfirmedSaveDestination: URL?
 
     init(config: Config) throws {
         self.config = config
@@ -247,6 +271,53 @@ final class WeChatAutomation {
         }
     }
 
+    private func mouseDrag(from start: CGPoint, to end: CGPoint) {
+        CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: start,
+            mouseButton: .left
+        )?.post(tap: .cghidEventTap)
+        usleep(100_000)
+
+        let down = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: start,
+            mouseButton: .left
+        )
+        down?.setIntegerValueField(.mouseEventClickState, value: 1)
+        down?.post(tap: .cghidEventTap)
+
+        let steps = 30
+        for step in 1...steps {
+            let fraction = CGFloat(step) / CGFloat(steps)
+            let point = CGPoint(
+                x: start.x + (end.x - start.x) * fraction,
+                y: start.y + (end.y - start.y) * fraction
+            )
+            let drag = CGEvent(
+                mouseEventSource: nil,
+                mouseType: .leftMouseDragged,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            )
+            drag?.setIntegerValueField(.mouseEventClickState, value: 1)
+            drag?.post(tap: .cghidEventTap)
+            usleep(15_000)
+        }
+
+        let up = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: end,
+            mouseButton: .left
+        )
+        up?.setIntegerValueField(.mouseEventClickState, value: 1)
+        up?.post(tap: .cghidEventTap)
+        pause(0.5)
+    }
+
     private func sendKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
         let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true)
         let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
@@ -378,77 +449,53 @@ final class WeChatAutomation {
         ].filter { !$0.isEmpty }
     }
 
-    private func unavailableMessage(in viewer: AXUIElement) -> String? {
-        let viewerFrame = frame(viewer)
-        let strings = descendants(viewer).filter { element in
-            if (attribute(element, kAXHiddenAttribute as CFString) as? Bool) == true { return false }
-            guard let bounds = frame(element), let viewerFrame else { return true }
-            return bounds.width > 0 && bounds.height > 0 && bounds.intersects(viewerFrame)
-        }.flatMap(controlStrings)
-        return unavailableMediaMessage(in: strings)
-    }
-
-    private func throwIfUnavailable(_ viewer: AXUIElement) throws {
-        if let message = unavailableMessage(in: viewer) {
-            throw MediaItemError.unavailable(message)
-        }
-    }
-
     private func isSaveButton(_ element: AXUIElement) -> Bool {
         controlStrings(element).contains(where: isSaveControlName)
     }
 
-    private func saveButton(in viewer: AXUIElement) -> AXUIElement? {
-        let candidates = elements(in: viewer, role: kAXButtonRole as String).filter(isSaveButton)
-        if string(viewer, kAXTitleAttribute as CFString).hasPrefix("Chat history of") {
-            return candidates.first { bool($0, kAXEnabledAttribute as CFString) }
-        }
-        let toolbarCandidate = candidates.first {
-            guard let bounds = frame($0), let viewerFrame = frame(viewer) else { return false }
-            return bounds.intersects(viewerFrame)
-                && bounds.minY < viewerFrame.minY + max(140, viewerFrame.height * 0.2)
-                && bool($0, kAXEnabledAttribute as CFString)
-        }
-        return toolbarCandidate ?? candidates.first { bool($0, kAXEnabledAttribute as CFString) }
+    private func buttonDiagnostics(in element: AXUIElement) -> String {
+        let names = elements(in: element, role: kAXButtonRole as String).flatMap(controlStrings)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let unique = Array(NSOrderedSet(array: names)).compactMap { $0 as? String }
+        return unique.prefix(20).joined(separator: ", ")
     }
 
-    private func textFields(in element: AXUIElement) -> [AXUIElement] {
-        elements(in: element, role: kAXTextFieldRole as String).filter { field in
-            let labels = controlStrings(field).joined(separator: " ").lowercased()
-            return !labels.contains("tag editor") && !labels.contains("search")
-        }
-    }
-
-    private func isSavePanel(_ element: AXUIElement) -> Bool {
-        let labels = controlStrings(element)
-        let explicitlyNamed = labels.contains(where: isSaveControlName)
-            || labels.contains(where: { $0.lowercased().contains("save dialog") })
-        let hasSaveAction = elements(in: element, role: kAXButtonRole as String).contains(where: isSaveButton)
-        return explicitlyNamed || (hasSaveAction && !textFields(in: element).isEmpty)
-    }
-
-    private func activeSaveDialog(for viewer: AXUIElement) -> SaveDialog? {
-        if let sheet = elements(in: viewer, role: kAXSheetRole as String).first(where: isSavePanel) {
-            return SaveDialog(root: sheet, hostWindow: viewer)
-        }
-        if let saveWindow = windows().first(where: { candidate in
-            !sameElement(candidate, viewer) && isSavePanel(candidate)
+    private func newDestinationDialog(
+        for history: AXUIElement,
+        excluding existingWindows: [AXUIElement],
+        existingSheets: [AXUIElement]
+    ) -> SaveDialog? {
+        if let sheet = elements(in: history, role: kAXSheetRole as String).first(where: { candidate in
+            !existingSheets.contains(where: { sameElement(candidate, $0) })
         }) {
-            return SaveDialog(root: saveWindow, hostWindow: saveWindow)
+            return SaveDialog(root: sheet, hostWindow: history)
+        }
+        if let panel = windows().first(where: { candidate in
+            !sameElement(candidate, history)
+                && !existingWindows.contains(where: { sameElement(candidate, $0) })
+        }) {
+            return SaveDialog(root: panel, hostWindow: panel)
         }
         return nil
     }
 
-    private func suggestedFilename(in dialog: SaveDialog) -> String? {
-        let values = textFields(in: dialog.root).compactMap { field -> String? in
-            let value = string(field, kAXValueAttribute as CFString).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty, !value.contains("/") else { return nil }
-            return value
+    private func dialogIsPresent(_ dialog: SaveDialog) -> Bool {
+        if sameElement(dialog.root, dialog.hostWindow) {
+            return windows().contains(where: { sameElement($0, dialog.root) })
         }
-        return values.first(where: { $0.contains(".") }) ?? values.first
+        return elements(in: dialog.hostWindow, role: kAXSheetRole as String).contains(where: {
+            sameElement($0, dialog.root)
+        })
     }
 
     private func cancel(_ dialog: SaveDialog) {
+        if let rawButton = attribute(dialog.root, kAXCancelButtonAttribute as CFString) {
+            let button = rawButton as! AXUIElement
+            _ = press(button)
+            pause(0.3)
+            return
+        }
         if let button = elements(in: dialog.root, role: kAXButtonRole as String).last(where: { candidate in
             controlStrings(candidate).contains(where: isCancelControlName)
         }) {
@@ -459,69 +506,9 @@ final class WeChatAutomation {
 
     private func cancelAnySaveDialog(for viewer: AXUIElement) {
         // Escape a possible nested Go to Folder sheet first.
-        sendKey(53)
-        pause(0.15)
-        if let current = activeSaveDialog(for: viewer) {
-            cancel(current)
-        }
-    }
-
-    private func revealControls(in viewer: AXUIElement) {
-        guard let bounds = frame(viewer), bounds.width > 0, bounds.height > 0 else { return }
-        let point = CGPoint(x: bounds.midX, y: bounds.minY + min(110, bounds.height / 3))
-        CGEvent(
-            mouseEventSource: nil,
-            mouseType: .mouseMoved,
-            mouseCursorPosition: point,
-            mouseButton: .left
-        )?.post(tap: .cghidEventTap)
-        pause(0.15)
-    }
-
-    private func presentSaveDialog(from viewer: AXUIElement) throws -> SaveDialog {
         bringForward(viewer)
-        try throwIfUnavailable(viewer)
-
-        let deadline = Date().addingTimeInterval(TimeInterval(max(8, config.waitForDownloadsSeconds)))
-        var buttonAttempts = 0
-        var shortcutAttempts = 0
-        var nextControlRefresh = Date.distantPast
-        var nextButtonAttempt = Date.distantPast
-        var nextShortcutAttempt = Date.distantPast
-
-        while Date() < deadline {
-            if let dialog = activeSaveDialog(for: viewer) { return dialog }
-            try throwIfUnavailable(viewer)
-
-            if Date() >= nextControlRefresh {
-                revealControls(in: viewer)
-                nextControlRefresh = Date().addingTimeInterval(1.0)
-            }
-
-            if buttonAttempts < 2, Date() >= nextButtonAttempt, let button = saveButton(in: viewer) {
-                try mouseClick(button)
-                buttonAttempts += 1
-                nextButtonAttempt = Date().addingTimeInterval(4.0)
-                pause(0.5)
-                continue
-            }
-
-            if shortcutAttempts < 2, Date() >= nextShortcutAttempt {
-                bringForward(viewer)
-                sendKey(1, flags: .maskCommand) // Command-S
-                shortcutAttempts += 1
-                nextShortcutAttempt = Date().addingTimeInterval(5.0)
-                pause(0.5)
-                continue
-            }
-            pause(0.25)
-        }
-
-        try throwIfUnavailable(viewer)
-        throw ExporterError.message(
-            "No Save dialog appeared after trying WeChat's Save control and Command-S. "
-            + "The item may still be loading, or this WeChat version may expose different controls."
-        )
+        sendKey(53)
+        pause(0.25)
     }
 
     private func setDestination(_ destination: URL, for dialog: SaveDialog) throws {
@@ -552,46 +539,23 @@ final class WeChatAutomation {
         }
     }
 
-    private func commitSave(_ dialog: SaveDialog) throws {
-        guard let button = elements(in: dialog.root, role: kAXButtonRole as String).filter(isSaveButton).last else {
-            throw ExporterError.message("The macOS Save button was unavailable.")
+    private func commitDestination(_ dialog: SaveDialog) throws {
+        if let rawButton = attribute(dialog.root, kAXDefaultButtonAttribute as CFString) {
+            let button = rawButton as! AXUIElement
+            if bool(button, kAXEnabledAttribute as CFString), press(button) { return }
+        }
+        guard let button = elements(in: dialog.root, role: kAXButtonRole as String).last(where: { candidate in
+            bool(candidate, kAXEnabledAttribute as CFString)
+                && controlStrings(candidate).contains(where: isDestinationConfirmName)
+        }) else {
+            let visible = buttonDiagnostics(in: dialog.root)
+            throw ExporterError.message(
+                "The folder chooser's confirmation button was unavailable. Visible buttons: \(visible)"
+            )
         }
         guard press(button) else {
-            throw ExporterError.message("The macOS Save button could not be pressed.")
+            throw ExporterError.message("The folder chooser's confirmation button could not be pressed.")
         }
-    }
-
-    private func saveCurrentItem(from viewer: AXUIElement, to destination: URL) throws -> (filename: String, existed: Bool) {
-        let dialog = try presentSaveDialog(from: viewer)
-        guard let filename = wait(seconds: 4, { self.suggestedFilename(in: dialog) }) else {
-            cancel(dialog)
-            throw ExporterError.message("A Save dialog appeared, but its filename field was unavailable.")
-        }
-        let target = destination.appendingPathComponent(filename)
-        if fileManager.fileExists(atPath: target.path) {
-            cancel(dialog)
-            return (filename, true)
-        }
-
-        do {
-            if lastConfirmedSaveDestination != destination {
-                try setDestination(destination, for: dialog)
-            }
-            guard let refreshedDialog = wait(seconds: 3, { self.activeSaveDialog(for: viewer) }) else {
-                throw ExporterError.message("The macOS Save dialog closed before the file was committed.")
-            }
-            try commitSave(refreshedDialog)
-            guard wait(seconds: TimeInterval(config.waitForDownloadsSeconds), {
-                self.fileManager.fileExists(atPath: target.path) ? true : nil
-            }) != nil else {
-                throw ExporterError.message("Timed out waiting for \(filename) to be written.")
-            }
-        } catch {
-            cancelAnySaveDialog(for: viewer)
-            throw error
-        }
-        lastConfirmedSaveDestination = destination
-        return (filename, false)
     }
 
     private func cleanFolderName(_ raw: String) -> String {
@@ -624,11 +588,12 @@ final class WeChatAutomation {
 
     private func visibleMediaTiles(in history: AXUIElement) -> [MediaTile] {
         guard let historyFrame = frame(history) else { return [] }
+        let safeFrame = historyFrame.insetBy(dx: 12, dy: 12)
         return elements(in: history, role: kAXStaticTextRole as String).compactMap { element -> MediaTile? in
             let type = string(element, kAXTitleAttribute as CFString)
             guard type == "Image" || type == "Video", let bounds = frame(element),
                   bounds.width > 0, bounds.height > 0,
-                  bounds.intersects(historyFrame), bounds.minY > historyFrame.minY + 100 else { return nil }
+                  safeFrame.contains(bounds), bounds.minY > historyFrame.minY + 100 else { return nil }
             return MediaTile(type: type, element: element, frame: bounds)
         }.sorted { lhs, rhs in
             if abs(lhs.frame.minY - rhs.frame.minY) > 3 { return lhs.frame.minY < rhs.frame.minY }
@@ -636,80 +601,217 @@ final class WeChatAutomation {
         }
     }
 
-    private func waitForStandaloneViewer(
-        seconds: TimeInterval,
-        history: AXUIElement,
-        excluding existingWindows: [AXUIElement]
-    ) throws -> AXUIElement? {
-        let deadline = Date().addingTimeInterval(seconds)
-        repeat {
-            if let viewer = window(exactTitle: "Photos and Videos") {
-                return viewer
-            }
-            if let viewer = windows().first(where: { candidate in
-                !sameElement(candidate, history)
-                    && !existingWindows.contains(where: { sameElement(candidate, $0) })
-                    && !isSavePanel(candidate)
-            }) {
-                return viewer
-            }
-            try throwIfUnavailable(history)
-            pause(0.15)
-        } while Date() < deadline
-        return nil
+    private func batchSaveButton(in history: AXUIElement) -> AXUIElement? {
+        guard let historyFrame = frame(history) else { return nil }
+        return elements(in: history, role: kAXButtonRole as String).filter { button in
+            guard isSaveButton(button), bool(button, kAXEnabledAttribute as CFString),
+                  let bounds = frame(button), bounds.intersects(historyFrame) else { return false }
+            return bounds.midY > historyFrame.midY
+        }.max { lhs, rhs in
+            (frame(lhs)?.midY ?? 0) < (frame(rhs)?.midY ?? 0)
+        }
     }
 
-    private func openTile(_ tile: MediaTile, in history: AXUIElement) throws -> AXUIElement {
+    private func clearBatchSelection(in history: AXUIElement) {
+        guard batchSaveButton(in: history) != nil else { return }
+        bringForward(history)
+        sendKey(53) // Escape clears the rubber-band selection.
+        _ = wait(seconds: 2, { self.batchSaveButton(in: history) == nil ? true : nil })
+        pause(0.2)
+    }
+
+    private func rectangularTilePrefix(_ tiles: [MediaTile], maximumCount: Int) -> [MediaTile] {
+        var rows: [[MediaTile]] = []
+        for tile in tiles {
+            if let lastY = rows.last?.first?.frame.minY, abs(lastY - tile.frame.minY) <= 3 {
+                rows[rows.count - 1].append(tile)
+            } else {
+                rows.append([tile])
+            }
+        }
+
+        var selected: [MediaTile] = []
+        for row in rows {
+            let remaining = maximumCount - selected.count
+            if remaining <= 0 { break }
+            if row.count <= remaining {
+                selected.append(contentsOf: row)
+            } else if selected.isEmpty {
+                selected.append(contentsOf: row.prefix(remaining))
+            } else {
+                break
+            }
+        }
+        return selected
+    }
+
+    private func selectVisibleBatch(
+        in history: AXUIElement,
+        tiles: [MediaTile],
+        maximumCount: Int
+    ) throws -> (button: AXUIElement, selectedCount: Int) {
+        clearBatchSelection(in: history)
+        let selectedTiles = rectangularTilePrefix(tiles, maximumCount: max(1, maximumCount))
+        guard let historyFrame = frame(history),
+              let points = selectionDragPoints(for: selectedTiles.map(\.frame), within: historyFrame) else {
+            throw ExporterError.message("The visible media grid did not leave enough room for drag selection.")
+        }
+
+        bringForward(history)
+        mouseDrag(from: points.start, to: points.end)
+        if let button = wait(seconds: 4, { self.batchSaveButton(in: history) }) {
+            return (button, selectedTiles.count)
+        }
+
+        // A few WeChat builds begin rubber-band selection more reliably from
+        // the lower-right gutter, so retry once in the opposite direction.
+        bringForward(history)
+        sendKey(53)
+        pause(0.2)
+        mouseDrag(from: points.end, to: points.start)
+        guard let button = wait(seconds: 4, { self.batchSaveButton(in: history) }) else {
+            let visible = buttonDiagnostics(in: history)
+            throw ExporterError.message(
+                "Drag selection completed, but WeChat did not show its batch Save button. "
+                + "Visible buttons: \(visible)"
+            )
+        }
+        return (button, selectedTiles.count)
+    }
+
+    private func visibleProgressIndicators(in history: AXUIElement) -> [AXUIElement] {
+        guard let historyFrame = frame(history) else { return [] }
+        return elements(in: history, role: kAXProgressIndicatorRole as String).filter { indicator in
+            if (attribute(indicator, kAXHiddenAttribute as CFString) as? Bool) == true { return false }
+            guard let bounds = frame(indicator) else { return true }
+            return bounds.width > 0 && bounds.height > 0 && bounds.intersects(historyFrame)
+        }
+    }
+
+    private func progressIsComplete(_ indicator: AXUIElement) -> Bool {
+        guard let value = (attribute(indicator, kAXValueAttribute as CFString) as? NSNumber)?.doubleValue else {
+            return false
+        }
+        let maximum = (attribute(indicator, kAXMaxValueAttribute as CFString) as? NSNumber)?.doubleValue ?? 1
+        return maximum > 0 && value >= maximum - 0.000_001
+    }
+
+    private func stagingSnapshot(_ directory: URL) -> [String: UInt64] {
+        let files = (try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        var result: [String: UInt64] = [:]
+        for file in files {
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            result[file.lastPathComponent] = UInt64(values.fileSize ?? 0)
+        }
+        return result
+    }
+
+    private func directoryIsEmpty(_ directory: URL) -> Bool {
+        ((try? fileManager.contentsOfDirectory(atPath: directory.path)) ?? []).isEmpty
+    }
+
+    private func waitForBatchCompletion(in history: AXUIElement, staging: URL) throws {
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(TimeInterval(max(300, config.waitForDownloadsSeconds)))
+        var lastSnapshot = stagingSnapshot(staging)
+        var lastChange = Date()
+        var sawProgress = false
+        var sawFileActivity = !lastSnapshot.isEmpty
+
+        while Date() < deadline {
+            let indicators = visibleProgressIndicators(in: history)
+            if !indicators.isEmpty { sawProgress = true }
+            let progressActive = indicators.contains(where: { !progressIsComplete($0) })
+
+            let snapshot = stagingSnapshot(staging)
+            if snapshot != lastSnapshot {
+                lastSnapshot = snapshot
+                lastChange = Date()
+                sawFileActivity = true
+            }
+
+            let stableFor = Date().timeIntervalSince(lastChange)
+            if sawProgress, !progressActive, stableFor >= 1.5 { return }
+            if sawFileActivity, !progressActive, stableFor >= 3.0 { return }
+
+            // When every selected item is unavailable, WeChat can finish
+            // without creating a file or leaving a progress indicator visible.
+            if !sawProgress, !sawFileActivity, Date().timeIntervalSince(startedAt) >= 12 { return }
+            pause(0.25)
+        }
+        throw ExporterError.message("Timed out waiting for WeChat's batch-save progress to finish.")
+    }
+
+    private func saveSelectedBatch(
+        in history: AXUIElement,
+        saveButton: AXUIElement,
+        selectedCount: Int,
+        staging: URL,
+        destination: URL
+    ) throws -> BatchExportResult {
+        let initialSnapshot = stagingSnapshot(staging)
         let existingWindows = windows()
-        bringForward(history)
-        try mouseClick(tile.element, count: tile.type == "Image" ? 2 : 1)
-        if tile.type == "Image" {
-            // Depending on the WeChat build and media type, an image can open
-            // either as an overlay inside Chat History or in the same standalone
-            // window used for videos. Targeting the wrong window makes Command-S
-            // disappear without ever opening a Save dialog.
-            if let viewer = try waitForStandaloneViewer(
-                seconds: 1.5,
-                history: history,
-                excluding: existingWindows
-            ) {
-                return viewer
+        let existingSheets = elements(in: history, role: kAXSheetRole as String)
+        try mouseClick(saveButton)
+        guard let dialog = wait(seconds: 8, {
+            self.newDestinationDialog(
+                for: history,
+                excluding: existingWindows,
+                existingSheets: existingSheets
+            )
+        }) else {
+            throw ExporterError.message("WeChat's batch Save button did not open a destination chooser.")
+        }
+
+        do {
+            try setDestination(staging, for: dialog)
+            try commitDestination(dialog)
+            guard wait(seconds: 5, { !self.dialogIsPresent(dialog) ? true : nil }) != nil else {
+                throw ExporterError.message("The destination chooser did not close after confirmation.")
             }
-            try throwIfUnavailable(history)
-            return history
+            try waitForBatchCompletion(in: history, staging: staging)
+        } catch {
+            bringForward(dialog.hostWindow)
+            sendKey(53) // Close a possible nested Go to Folder sheet.
+            pause(0.2)
+            if dialogIsPresent(dialog) { cancel(dialog) }
+            throw error
         }
-        if let viewer = try waitForStandaloneViewer(
-            seconds: 2.5,
-            history: history,
-            excluding: existingWindows
-        ) {
-            return viewer
+
+        let completedSnapshot = stagingSnapshot(staging)
+        guard completedSnapshot != initialSnapshot || completedSnapshot.isEmpty else {
+            throw ExporterError.message("WeChat reported completion, but the staging folder did not change.")
         }
-        bringForward(history)
-        try mouseClick(tile.element)
-        guard let viewer = try waitForStandaloneViewer(
-            seconds: 8,
-            history: history,
-            excluding: existingWindows
-        ) else {
-            throw ExporterError.message("WeChat did not open the selected video.")
-        }
-        return viewer
+        let merged = try mergeStagedFiles(fileManager: fileManager, from: staging, into: destination)
+        let skipped = max(0, selectedCount - merged.saved - merged.existing)
+        clearBatchSelection(in: history)
+        return BatchExportResult(
+            selected: selectedCount,
+            saved: merged.saved,
+            existing: merged.existing,
+            skipped: skipped
+        )
     }
 
-    private func closeTileViewer(_ viewer: AXUIElement, history: AXUIElement) {
-        if string(viewer, kAXTitleAttribute as CFString).hasPrefix("Chat history of") {
-            bringForward(history)
-            sendKey(53)
-            pause(0.3)
-        } else {
-            closeWindow(viewer)
-            pause(0.35)
+    private func galleryScrollValue(_ history: AXUIElement) -> Double? {
+        let scrollBars = elements(in: history, role: kAXScrollBarRole as String).filter { scrollBar in
+            guard let bounds = frame(scrollBar) else { return false }
+            return bounds.height > bounds.width
         }
+        return scrollBars.compactMap { scrollBar in
+            (attribute(scrollBar, kAXValueAttribute as CFString) as? NSNumber)?.doubleValue
+        }.max()
     }
 
-    private func scrollGalleryDown(_ history: AXUIElement) {
-        guard let bounds = frame(history) else { return }
+    @discardableResult
+    private func scrollGalleryDown(_ history: AXUIElement) -> Bool {
+        guard let bounds = frame(history) else { return false }
+        let before = galleryScrollValue(history)
         bringForward(history)
         let point = CGPoint(x: bounds.midX, y: bounds.maxY - 100)
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
@@ -718,87 +820,76 @@ final class WeChatAutomation {
             usleep(80_000)
         }
         pause(0.7)
-    }
-
-    private func destinationFilenames(_ destination: URL) -> Set<String> {
-        let names = (try? fileManager.contentsOfDirectory(atPath: destination.path)) ?? []
-        return Set(names)
+        guard let before, let after = galleryScrollValue(history) else { return true }
+        return abs(after - before) > 0.000_001
     }
 
     private func exportGallery(destination: URL) throws -> ExportStats {
-        let initialFiles = destinationFilenames(destination)
-        var encountered = Set<String>()
         var stats = ExportStats()
-        var openedCount = 0
-        var stagnantPages = 0
+        var selectedTotal = 0
         let history = try openHistoryMedia()
+        let staging = destination.appendingPathComponent(
+            ".wechat-media-exporter-staging-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+
         defer {
-            if activeSaveDialog(for: history) != nil { cancelAnySaveDialog(for: history) }
-            if let video = window(exactTitle: "Photos and Videos") { closeWindow(video) }
+            clearBatchSelection(in: history)
             sendKey(53)
             pause(0.2)
             if window(titlePrefix: "Chat history of") != nil { closeWindow(history) }
+
+            if directoryIsEmpty(staging) {
+                try? fileManager.removeItem(at: staging)
+            } else {
+                print("  Warning: unfinished staged files were retained at \(staging.path)")
+            }
         }
 
         for _ in 0..<max(1, config.maxScrollPages) {
+            let remaining = max(1, config.maxItemsPerChat) - selectedTotal
+            if remaining <= 0 { break }
+
             let tiles = visibleMediaTiles(in: history)
             if tiles.isEmpty {
-                if encountered.isEmpty { print("  No locally available media found.") }
+                if selectedTotal == 0 { print("  No locally available media found.") }
                 break
             }
-            var newOnPage = 0
-            for snapshot in tiles {
-                if openedCount >= max(1, config.maxItemsPerChat) { return stats }
 
-                // Reacquire by type and position after closing each viewer.
-                let currentTiles = visibleMediaTiles(in: history)
-                guard let tile = currentTiles.min(by: {
-                    let left = abs($0.frame.midX - snapshot.frame.midX) + abs($0.frame.midY - snapshot.frame.midY)
-                    let right = abs($1.frame.midX - snapshot.frame.midX) + abs($1.frame.midY - snapshot.frame.midY)
-                    return left < right
-                }), tile.type == snapshot.type else { continue }
+            do {
+                let selection = try selectVisibleBatch(
+                    in: history,
+                    tiles: tiles,
+                    maximumCount: remaining
+                )
+                selectedTotal += selection.selectedCount
+                let result = try saveSelectedBatch(
+                    in: history,
+                    saveButton: selection.button,
+                    selectedCount: selection.selectedCount,
+                    staging: staging,
+                    destination: destination
+                )
+                stats.saved += result.saved
+                stats.existing += result.existing
+                stats.skipped += result.skipped
+                print(
+                    "  Batch: \(result.selected) selected, \(result.saved) saved, "
+                    + "\(result.existing) already present, \(result.skipped) unavailable skipped."
+                )
 
-                var viewer: AXUIElement?
-                do {
-                    viewer = try openTile(tile, in: history)
-                    let result = try saveCurrentItem(from: viewer!, to: destination)
-                    openedCount += 1
-                    if encountered.insert(result.filename).inserted { newOnPage += 1 }
-                    if result.existed {
-                        stats.existing += 1
-                        print("  Existing: \(result.filename)")
-                        closeTileViewer(viewer!, history: history)
-                        viewer = nil
-                        if config.stopOnExisting && initialFiles.contains(result.filename) { return stats }
-                    } else {
-                        stats.saved += 1
-                        print("  Saved: \(result.filename)")
-                    }
-                } catch MediaItemError.unavailable(let reason) {
-                    stats.skipped += 1
-                    openedCount += 1
-                    newOnPage += 1
-                    print("  Skipped (\(tile.type.lowercased()), unavailable in WeChat): \(reason)")
-                    if viewer == nil, let standalone = window(exactTitle: "Photos and Videos") {
-                        closeWindow(standalone)
-                    } else if viewer == nil {
-                        bringForward(history)
-                        sendKey(53) // Close an unavailable-media overlay.
-                        pause(0.3)
-                    }
-                } catch {
-                    stats.failed += 1
-                    openedCount += 1
-                    print("  Warning (\(tile.type.lowercased())): \(error.localizedDescription)")
-                    cancelAnySaveDialog(for: viewer ?? history)
-                }
-                if let viewer { closeTileViewer(viewer, history: history) }
-                if stats.failed >= 10 { return stats }
+                if config.stopOnExisting, result.saved == 0, result.existing > 0 { break }
+            } catch {
+                stats.failed += 1
+                print("  Batch warning: \(error.localizedDescription)")
+                cancelAnySaveDialog(for: history)
+                clearBatchSelection(in: history)
+                break
             }
 
-            stagnantPages = newOnPage == 0 ? stagnantPages + 1 : 0
-            if stagnantPages >= 2 { break }
-            scrollGalleryDown(history)
+            if selectedTotal >= max(1, config.maxItemsPerChat) { break }
+            if !scrollGalleryDown(history) { break }
         }
         return stats
     }
@@ -1005,22 +1096,43 @@ private func printHelp() {
 }
 
 private func runSelfTests() -> Int32 {
-    let unavailableCases = [
-        "This photo has expired or been deleted.",
-        "This video is no longer available.",
-        "图片已过期或已被清理",
-        "圖片已過期或已被清理"
-    ]
-    for value in unavailableCases where unavailableMediaMessage(in: [value]) == nil {
-        fputs("Self-test failed: unavailable media was not recognized: \(value)\n", stderr)
-        return 1
-    }
-    guard unavailableMediaMessage(in: ["Image", "Delete after saving"]) == nil else {
-        fputs("Self-test failed: normal viewer text was classified as unavailable.\n", stderr)
-        return 1
-    }
     for value in ["Save", "Save As", "保存", "儲存", "下载"] where !isSaveControlName(value) {
         fputs("Self-test failed: Save control was not recognized: \(value)\n", stderr)
+        return 1
+    }
+    let frames = [CGRect(x: 100, y: 100, width: 50, height: 50), CGRect(x: 160, y: 100, width: 50, height: 50)]
+    guard let drag = selectionDragPoints(for: frames, within: CGRect(x: 0, y: 0, width: 300, height: 300)),
+          drag.start.x < 100, drag.start.y < 100, drag.end.x > 210, drag.end.y > 150 else {
+        fputs("Self-test failed: batch drag geometry did not enclose the media tiles.\n", stderr)
+        return 1
+    }
+    for value in ["Save", "Choose Folder", "Open", "选择"] where !isDestinationConfirmName(value) {
+        fputs("Self-test failed: destination confirmation was not recognized: \(value)\n", stderr)
+        return 1
+    }
+    let fileManager = FileManager.default
+    let testRoot = fileManager.temporaryDirectory.appendingPathComponent(
+        "wechat-media-exporter-self-test-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    defer { try? fileManager.removeItem(at: testRoot) }
+    do {
+        let staging = testRoot.appendingPathComponent("staging", isDirectory: true)
+        let destination = testRoot.appendingPathComponent("destination", isDirectory: true)
+        try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: destination.appendingPathComponent("existing.jpg"))
+        try Data("old".utf8).write(to: staging.appendingPathComponent("existing.jpg"))
+        try Data("new".utf8).write(to: staging.appendingPathComponent("new.mp4"))
+        let merged = try mergeStagedFiles(fileManager: fileManager, from: staging, into: destination)
+        guard merged.saved == 1, merged.existing == 1,
+              fileManager.fileExists(atPath: destination.appendingPathComponent("new.mp4").path),
+              (try fileManager.contentsOfDirectory(atPath: staging.path)).isEmpty else {
+            fputs("Self-test failed: staging merge did not deduplicate the batch.\n", stderr)
+            return 1
+        }
+    } catch {
+        fputs("Self-test failed: staging merge error: \(error.localizedDescription)\n", stderr)
         return 1
     }
     print("Self-test passed.")

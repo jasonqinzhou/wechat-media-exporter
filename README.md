@@ -1,8 +1,8 @@
 # WeChat Media Exporter for Mac
 
-This tool exports normal image and video files by automating WeChat's own **Chat History → Media → Save** workflow. It does not extract encryption keys, decrypt WeChat databases, inject code, or upload your data.
+This tool exports normal image and video files by automating WeChat's own **Chat History → Media → drag-select → Save** workflow. It does not extract encryption keys, decrypt WeChat databases, inject code, or upload your data.
 
-It was built and tested against WeChat **4.1.12 (build 269341)** on this Mac.
+It was developed against the WeChat **4.1.12** Mac interface. Because WeChat UI details vary by build, start with one chat and a small `maxItemsPerChat`.
 
 > Status: early beta. WeChat UI updates can require selector changes, so test a
 > small export after updating WeChat.
@@ -11,17 +11,19 @@ It was built and tested against WeChat **4.1.12 (build 269341)** on this Mac.
 
 - Walks the Recent Chats list, or only an exact allow-list of chat names.
 - Creates one destination subfolder per chat.
+- Drag-selects each visible page and uses WeChat's batch Save control.
+- Waits for WeChat's download progress to finish before scrolling onward.
 - Saves both images and videos using WeChat's own decoder.
-- Skips media that WeChat reports as expired, deleted, or no longer available.
-- Uses WeChat's suggested filename for stable incremental runs.
-- Stops a chat at the first filename already present by default.
+- Counts selected items that WeChat cannot produce as unavailable/skipped.
+- Uses a private staging folder so overlapping pages and reruns do not create duplicate-name prompts.
+- Stops when a batch contains only files already present by default.
 - Can install a daily `launchd` schedule.
 
 ## Important limitations
 
 - The exporter controls the WeChat interface while it runs. Do not use WeChat during an export.
 - Scheduled runs require WeChat to be running and logged in, with the Mac awake and unlocked.
-- It can export only media WeChat can still display. Expired/deleted media cannot be recovered and is counted as `unavailable skipped`, not as a warning.
+- It can export only media WeChat can still save. Expired/deleted media cannot be recovered and is counted as `unavailable skipped`, not as a warning.
 - A brand-new Mac install may have only recent history. Use WeChat's **Import chat history from phone** feature first if you want older phone history.
 - `allRecentChats` covers conversations in WeChat's Recent Chats list. Set `chats` to exact names if you want only selected conversations.
 - The UI labels are version-sensitive. Re-run `doctor` after a major WeChat update and test one chat before a large export.
@@ -77,7 +79,7 @@ Remove it with:
 '/path/to/WeChat Media Exporter/WeChat Media Exporter.app/Contents/MacOS/WeChat Media Exporter' schedule-remove
 ```
 
-The first archive can take a long time. For that run, keep the Mac awake and start with a small `maxItemsPerChat`; increase it after verifying the result. Later incremental runs should stop quickly when they encounter an already-exported filename.
+The first archive can take a long time. For that run, keep the Mac awake and start with a small `maxItemsPerChat`; increase it after verifying the result. Later incremental runs stop when a selected batch produces no new files and only files already in the destination.
 
 ## Recommended WeChat settings
 
