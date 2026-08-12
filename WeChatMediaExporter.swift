@@ -4,8 +4,53 @@ import CryptoKit
 import Foundation
 
 private let weChatBundleID = "com.tencent.xinWeChat"
-private let exporterVersion = "0.1.0"
+private let exporterVersion = "0.2.0"
 private let scheduleLabel = "com.local.wechat-media-exporter.daily"
+
+private let unavailableMediaMarkers = [
+    "expired or deleted",
+    "expired or has been deleted",
+    "has expired or been deleted",
+    "has expired or has been deleted",
+    "expired or been cleaned",
+    "expired or cleaned",
+    "no longer available",
+    "已过期或已被清理",
+    "已過期或已被清理",
+    "图片已过期",
+    "圖片已過期",
+    "视频已过期",
+    "影片已過期",
+    "檔案已過期",
+    "文件已过期"
+]
+
+private let saveControlNames = [
+    "save", "save as", "保存", "另存为", "另存為", "儲存", "存储", "下载", "下載"
+]
+
+private let cancelControlNames = ["cancel", "取消"]
+
+private func unavailableMediaMessage(in strings: [String]) -> String? {
+    for original in strings {
+        let normalized = original.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { continue }
+        if unavailableMediaMarkers.contains(where: { normalized.contains($0) }) {
+            return String(original.prefix(160))
+        }
+    }
+    return nil
+}
+
+private func isSaveControlName(_ value: String) -> Bool {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return saveControlNames.contains(normalized)
+}
+
+private func isCancelControlName(_ value: String) -> Bool {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return cancelControlNames.contains(normalized)
+}
 
 enum ExporterError: LocalizedError {
     case message(String)
@@ -13,6 +58,16 @@ enum ExporterError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .message(let message): return message
+        }
+    }
+}
+
+enum MediaItemError: LocalizedError {
+    case unavailable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable(let message): return message
         }
     }
 }
@@ -30,6 +85,7 @@ struct Config: Codable {
 struct ExportStats {
     var saved = 0
     var existing = 0
+    var skipped = 0
     var failed = 0
 }
 
@@ -129,6 +185,10 @@ final class WeChatAutomation {
 
     private func windows() -> [AXUIElement] {
         attribute(root, kAXWindowsAttribute as CFString) as? [AXUIElement] ?? []
+    }
+
+    private func sameElement(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
+        CFEqual(lhs, rhs)
     }
 
     private func window(exactTitle: String) -> AXUIElement? {
@@ -309,39 +369,89 @@ final class WeChatAutomation {
 
     // MARK: - Media viewer and save dialogs
 
-    private func saveButton(in viewer: AXUIElement) -> AXUIElement? {
-        let candidates = elements(in: viewer, role: kAXButtonRole as String, title: "Save")
-        if string(viewer, kAXTitleAttribute as CFString).hasPrefix("Chat history of") {
-            return candidates.first
-        }
-        return candidates.first {
-            guard let bounds = frame($0), let viewerFrame = frame(viewer) else { return false }
-            return bounds.minY < viewerFrame.minY + 80
+    private func controlStrings(_ element: AXUIElement) -> [String] {
+        [
+            string(element, kAXTitleAttribute as CFString),
+            string(element, kAXDescriptionAttribute as CFString),
+            string(element, kAXHelpAttribute as CFString),
+            string(element, kAXValueAttribute as CFString)
+        ].filter { !$0.isEmpty }
+    }
+
+    private func unavailableMessage(in viewer: AXUIElement) -> String? {
+        let viewerFrame = frame(viewer)
+        let strings = descendants(viewer).filter { element in
+            if (attribute(element, kAXHiddenAttribute as CFString) as? Bool) == true { return false }
+            guard let bounds = frame(element), let viewerFrame else { return true }
+            return bounds.width > 0 && bounds.height > 0 && bounds.intersects(viewerFrame)
+        }.flatMap(controlStrings)
+        return unavailableMediaMessage(in: strings)
+    }
+
+    private func throwIfUnavailable(_ viewer: AXUIElement) throws {
+        if let message = unavailableMessage(in: viewer) {
+            throw MediaItemError.unavailable(message)
         }
     }
 
+    private func isSaveButton(_ element: AXUIElement) -> Bool {
+        controlStrings(element).contains(where: isSaveControlName)
+    }
+
+    private func saveButton(in viewer: AXUIElement) -> AXUIElement? {
+        let candidates = elements(in: viewer, role: kAXButtonRole as String).filter(isSaveButton)
+        if string(viewer, kAXTitleAttribute as CFString).hasPrefix("Chat history of") {
+            return candidates.first { bool($0, kAXEnabledAttribute as CFString) }
+        }
+        let toolbarCandidate = candidates.first {
+            guard let bounds = frame($0), let viewerFrame = frame(viewer) else { return false }
+            return bounds.intersects(viewerFrame)
+                && bounds.minY < viewerFrame.minY + max(140, viewerFrame.height * 0.2)
+                && bool($0, kAXEnabledAttribute as CFString)
+        }
+        return toolbarCandidate ?? candidates.first { bool($0, kAXEnabledAttribute as CFString) }
+    }
+
+    private func textFields(in element: AXUIElement) -> [AXUIElement] {
+        elements(in: element, role: kAXTextFieldRole as String).filter { field in
+            let labels = controlStrings(field).joined(separator: " ").lowercased()
+            return !labels.contains("tag editor") && !labels.contains("search")
+        }
+    }
+
+    private func isSavePanel(_ element: AXUIElement) -> Bool {
+        let labels = controlStrings(element)
+        let explicitlyNamed = labels.contains(where: isSaveControlName)
+            || labels.contains(where: { $0.lowercased().contains("save dialog") })
+        let hasSaveAction = elements(in: element, role: kAXButtonRole as String).contains(where: isSaveButton)
+        return explicitlyNamed || (hasSaveAction && !textFields(in: element).isEmpty)
+    }
+
     private func activeSaveDialog(for viewer: AXUIElement) -> SaveDialog? {
-        if let sheet = elements(in: viewer, role: kAXSheetRole as String).first(where: {
-            string($0, kAXDescriptionAttribute as CFString) == "save"
-        }) {
+        if let sheet = elements(in: viewer, role: kAXSheetRole as String).first(where: isSavePanel) {
             return SaveDialog(root: sheet, hostWindow: viewer)
         }
-        if let saveWindow = window(exactTitle: "Save") {
+        if let saveWindow = windows().first(where: { candidate in
+            !sameElement(candidate, viewer) && isSavePanel(candidate)
+        }) {
             return SaveDialog(root: saveWindow, hostWindow: saveWindow)
         }
         return nil
     }
 
     private func suggestedFilename(in dialog: SaveDialog) -> String? {
-        elements(in: dialog.root, role: kAXTextFieldRole as String).compactMap { field -> String? in
-            guard string(field, kAXDescriptionAttribute as CFString) != "tag editor" else { return nil }
-            let value = string(field, kAXValueAttribute as CFString)
-            return value.contains(".") ? value : nil
-        }.first
+        let values = textFields(in: dialog.root).compactMap { field -> String? in
+            let value = string(field, kAXValueAttribute as CFString).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, !value.contains("/") else { return nil }
+            return value
+        }
+        return values.first(where: { $0.contains(".") }) ?? values.first
     }
 
     private func cancel(_ dialog: SaveDialog) {
-        if let button = elements(in: dialog.root, role: kAXButtonRole as String, title: "Cancel").last {
+        if let button = elements(in: dialog.root, role: kAXButtonRole as String).last(where: { candidate in
+            controlStrings(candidate).contains(where: isCancelControlName)
+        }) {
             _ = press(button)
             pause(0.3)
         }
@@ -354,6 +464,64 @@ final class WeChatAutomation {
         if let current = activeSaveDialog(for: viewer) {
             cancel(current)
         }
+    }
+
+    private func revealControls(in viewer: AXUIElement) {
+        guard let bounds = frame(viewer), bounds.width > 0, bounds.height > 0 else { return }
+        let point = CGPoint(x: bounds.midX, y: bounds.minY + min(110, bounds.height / 3))
+        CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        )?.post(tap: .cghidEventTap)
+        pause(0.15)
+    }
+
+    private func presentSaveDialog(from viewer: AXUIElement) throws -> SaveDialog {
+        bringForward(viewer)
+        try throwIfUnavailable(viewer)
+
+        let deadline = Date().addingTimeInterval(TimeInterval(max(8, config.waitForDownloadsSeconds)))
+        var buttonAttempts = 0
+        var shortcutAttempts = 0
+        var nextControlRefresh = Date.distantPast
+        var nextButtonAttempt = Date.distantPast
+        var nextShortcutAttempt = Date.distantPast
+
+        while Date() < deadline {
+            if let dialog = activeSaveDialog(for: viewer) { return dialog }
+            try throwIfUnavailable(viewer)
+
+            if Date() >= nextControlRefresh {
+                revealControls(in: viewer)
+                nextControlRefresh = Date().addingTimeInterval(1.0)
+            }
+
+            if buttonAttempts < 2, Date() >= nextButtonAttempt, let button = saveButton(in: viewer) {
+                try mouseClick(button)
+                buttonAttempts += 1
+                nextButtonAttempt = Date().addingTimeInterval(4.0)
+                pause(0.5)
+                continue
+            }
+
+            if shortcutAttempts < 2, Date() >= nextShortcutAttempt {
+                bringForward(viewer)
+                sendKey(1, flags: .maskCommand) // Command-S
+                shortcutAttempts += 1
+                nextShortcutAttempt = Date().addingTimeInterval(5.0)
+                pause(0.5)
+                continue
+            }
+            pause(0.25)
+        }
+
+        try throwIfUnavailable(viewer)
+        throw ExporterError.message(
+            "No Save dialog appeared after trying WeChat's Save control and Command-S. "
+            + "The item may still be loading, or this WeChat version may expose different controls."
+        )
     }
 
     private func setDestination(_ destination: URL, for dialog: SaveDialog) throws {
@@ -385,7 +553,7 @@ final class WeChatAutomation {
     }
 
     private func commitSave(_ dialog: SaveDialog) throws {
-        guard let button = elements(in: dialog.root, role: kAXButtonRole as String, title: "Save").last else {
+        guard let button = elements(in: dialog.root, role: kAXButtonRole as String).filter(isSaveButton).last else {
             throw ExporterError.message("The macOS Save button was unavailable.")
         }
         guard press(button) else {
@@ -394,22 +562,10 @@ final class WeChatAutomation {
     }
 
     private func saveCurrentItem(from viewer: AXUIElement, to destination: URL) throws -> (filename: String, existed: Bool) {
-        bringForward(viewer)
-        if string(viewer, kAXTitleAttribute as CFString).hasPrefix("Chat history of") {
-            sendKey(1, flags: .maskCommand) // Command-S
-        } else {
-            guard let button = wait(seconds: TimeInterval(config.waitForDownloadsSeconds), { () -> AXUIElement? in
-                guard let candidate = self.saveButton(in: viewer), self.bool(candidate, kAXEnabledAttribute as CFString) else { return nil }
-                return candidate
-            }) else {
-                throw ExporterError.message("The current media item did not finish loading in WeChat.")
-            }
-            try mouseClick(button)
-        }
-
-        guard let dialog = wait(seconds: 8, { self.activeSaveDialog(for: viewer) }),
-              let filename = wait(seconds: 3, { self.suggestedFilename(in: dialog) }) else {
-            throw ExporterError.message("WeChat did not present a usable Save dialog.")
+        let dialog = try presentSaveDialog(from: viewer)
+        guard let filename = wait(seconds: 4, { self.suggestedFilename(in: dialog) }) else {
+            cancel(dialog)
+            throw ExporterError.message("A Save dialog appeared, but its filename field was unavailable.")
         }
         let target = destination.appendingPathComponent(filename)
         if fileManager.fileExists(atPath: target.path) {
@@ -480,19 +636,62 @@ final class WeChatAutomation {
         }
     }
 
+    private func waitForStandaloneViewer(
+        seconds: TimeInterval,
+        history: AXUIElement,
+        excluding existingWindows: [AXUIElement]
+    ) throws -> AXUIElement? {
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
+            if let viewer = window(exactTitle: "Photos and Videos") {
+                return viewer
+            }
+            if let viewer = windows().first(where: { candidate in
+                !sameElement(candidate, history)
+                    && !existingWindows.contains(where: { sameElement(candidate, $0) })
+                    && !isSavePanel(candidate)
+            }) {
+                return viewer
+            }
+            try throwIfUnavailable(history)
+            pause(0.15)
+        } while Date() < deadline
+        return nil
+    }
+
     private func openTile(_ tile: MediaTile, in history: AXUIElement) throws -> AXUIElement {
+        let existingWindows = windows()
         bringForward(history)
         try mouseClick(tile.element, count: tile.type == "Image" ? 2 : 1)
         if tile.type == "Image" {
-            pause(0.55)
+            // Depending on the WeChat build and media type, an image can open
+            // either as an overlay inside Chat History or in the same standalone
+            // window used for videos. Targeting the wrong window makes Command-S
+            // disappear without ever opening a Save dialog.
+            if let viewer = try waitForStandaloneViewer(
+                seconds: 1.5,
+                history: history,
+                excluding: existingWindows
+            ) {
+                return viewer
+            }
+            try throwIfUnavailable(history)
             return history
         }
-        if let viewer = wait(seconds: 2.5, { self.window(exactTitle: "Photos and Videos") }) {
+        if let viewer = try waitForStandaloneViewer(
+            seconds: 2.5,
+            history: history,
+            excluding: existingWindows
+        ) {
             return viewer
         }
         bringForward(history)
         try mouseClick(tile.element)
-        guard let viewer = wait(seconds: 8, { self.window(exactTitle: "Photos and Videos") }) else {
+        guard let viewer = try waitForStandaloneViewer(
+            seconds: 8,
+            history: history,
+            excluding: existingWindows
+        ) else {
             throw ExporterError.message("WeChat did not open the selected video.")
         }
         return viewer
@@ -534,7 +733,7 @@ final class WeChatAutomation {
         var stagnantPages = 0
         let history = try openHistoryMedia()
         defer {
-            if window(exactTitle: "Save") != nil { cancelAnySaveDialog(for: history) }
+            if activeSaveDialog(for: history) != nil { cancelAnySaveDialog(for: history) }
             if let video = window(exactTitle: "Photos and Videos") { closeWindow(video) }
             sendKey(53)
             pause(0.2)
@@ -574,6 +773,18 @@ final class WeChatAutomation {
                     } else {
                         stats.saved += 1
                         print("  Saved: \(result.filename)")
+                    }
+                } catch MediaItemError.unavailable(let reason) {
+                    stats.skipped += 1
+                    openedCount += 1
+                    newOnPage += 1
+                    print("  Skipped (\(tile.type.lowercased()), unavailable in WeChat): \(reason)")
+                    if viewer == nil, let standalone = window(exactTitle: "Photos and Videos") {
+                        closeWindow(standalone)
+                    } else if viewer == nil {
+                        bringForward(history)
+                        sendKey(53) // Close an unavailable-media overlay.
+                        pause(0.3)
                     }
                 } catch {
                     stats.failed += 1
@@ -627,6 +838,7 @@ final class WeChatAutomation {
                     let stats = try exportCurrentChat(destinationRoot: destinationRoot, folderName: candidate.name)
                     total.saved += stats.saved
                     total.existing += stats.existing
+                    total.skipped += stats.skipped
                     total.failed += stats.failed
                 } catch {
                     total.failed += 1
@@ -783,12 +995,36 @@ private func printHelp() {
 
     Commands:
       doctor [--prompt]
+      self-test
       list-visible-chats
       run --config /absolute/path/config.json
       export-current --destination /path/to/folder [--max-items 500]
       schedule-install --config /absolute/path/config.json --hour 3 [--minute 0]
       schedule-remove
     """)
+}
+
+private func runSelfTests() -> Int32 {
+    let unavailableCases = [
+        "This photo has expired or been deleted.",
+        "This video is no longer available.",
+        "图片已过期或已被清理",
+        "圖片已過期或已被清理"
+    ]
+    for value in unavailableCases where unavailableMediaMessage(in: [value]) == nil {
+        fputs("Self-test failed: unavailable media was not recognized: \(value)\n", stderr)
+        return 1
+    }
+    guard unavailableMediaMessage(in: ["Image", "Delete after saving"]) == nil else {
+        fputs("Self-test failed: normal viewer text was classified as unavailable.\n", stderr)
+        return 1
+    }
+    for value in ["Save", "Save As", "保存", "儲存", "下载"] where !isSaveControlName(value) {
+        fputs("Self-test failed: Save control was not recognized: \(value)\n", stderr)
+        return 1
+    }
+    print("Self-test passed.")
+    return 0
 }
 
 private func main() -> Int32 {
@@ -801,6 +1037,9 @@ private func main() -> Int32 {
         switch command {
         case "doctor":
             return doctor(prompt: arguments.contains("--prompt"))
+
+        case "self-test":
+            return runSelfTests()
 
         case "list-visible-chats":
             let automation = try WeChatAutomation(config: Config(destination: "."))
@@ -822,7 +1061,7 @@ private func main() -> Int32 {
             } else {
                 throw ExporterError.message("Unknown config mode: \(config.mode)")
             }
-            print("Done: \(stats.saved) saved, \(stats.existing) already present, \(stats.failed) warnings.")
+            print("Done: \(stats.saved) saved, \(stats.existing) already present, \(stats.skipped) unavailable skipped, \(stats.failed) warnings.")
             return stats.failed == 0 ? 0 : 2
 
         case "export-current":
@@ -836,7 +1075,7 @@ private func main() -> Int32 {
             let destination = expandedURL(destinationPath)
             let automation = try WeChatAutomation(config: config)
             let stats = try automation.exportCurrentChat(destinationRoot: destination)
-            print("Done: \(stats.saved) saved, \(stats.existing) already present, \(stats.failed) warnings.")
+            print("Done: \(stats.saved) saved, \(stats.existing) already present, \(stats.skipped) unavailable skipped, \(stats.failed) warnings.")
             return stats.failed == 0 ? 0 : 2
 
         case "schedule-install":

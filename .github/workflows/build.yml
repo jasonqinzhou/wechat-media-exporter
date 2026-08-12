@@ -10,5 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build and verify app bundle
-        run: ./build.sh
-
+        run: |
+          ./build.sh
+          './WeChat Media Exporter.app/Contents/MacOS/WeChat Media Exporter' self-test
